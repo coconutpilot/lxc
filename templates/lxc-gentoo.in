@@ -26,30 +26,7 @@
 # defaults
 cache=/var/cache/lxc/gentoo
 default_path=/var/lib/lxc
-mirror_base="http://distfiles.gentoo.org/releases"
-
-if [ "${EUID}" != "0" ]; then
-    echo "This script must be run as 'root'"
-    exit 1
-fi
-
-if [ ! -d ${cache} ]; then
-    info "Creating cache dir '${cache}' ..."
-    mkdir -p ${cache}
-    if [ ${?} -ne 0 ]; then
-        echo "Error creating cache dir"
-        exit 1
-    fi
-fi
-
-if [ ! -d /var/lock/subsys ]; then
-    info "Creating control dir '/var/lock/subsys' ..."
-    mkdir -p /var/lock/subsys
-    if [ ${?} -ne 0 ]; then
-        echo "Error creating control dir"
-        exit 1
-    fi
-fi
+mirror_base="http://distfiles.gentoo.org"
 
 [ -f /etc/gentoo-release ] && is_gentoo=true
 
@@ -68,6 +45,7 @@ Optional args:
   -p,--path=PATH    directory for the container rootfs and config, defaults
                     to '${default_path}/<name>'
   -a,--arch         architecture (x86 or amd64), defaults to current architecture
+     --password     password for root account
   -v,--verbose      verbose mode
   -d,--debug        debug mode
   -h,--help         print this help
@@ -75,7 +53,7 @@ EOF
     return 0
 }
 
-options=$(getopt -o vdhp:n:a: -l verbose,debug,help,path:,name:arch -- "${@}")
+options=$(getopt -o vdhp:n:a: -l verbose,debug,help,path:,name:,arch:,password: -- "${@}")
 if [ ${?} -ne 0 ]; then
     usage $(basename ${0})
     exit 1
@@ -91,6 +69,7 @@ do
     -p|--path)      ct_path=${2}; shift 2;;
     -n|--name)      name=${2};    shift 2;;
     -a|--arch)      arch=${2};    shift 2;;
+       --password)  password=${2} shift 2;;
     --)             shift 1;      break ;;
     *)              break ;;
     esac
@@ -111,12 +90,12 @@ fi
 
 if [ -e "$ct_path" ]; then
     echo "Error: dir '${ct_path}' already exists (check for existing CT with same name)"
-    exit 1
+#    exit 1
 fi
 
 if [ -e "/etc/lxc/${name}" ]; then
     echo "Error: dir '/etc/lxc/${name}' already exists (check for existing CT with same name)"
-    exit 1
+#    exit 1
 fi
 
 if [ -z "${arch}" ]; then
@@ -134,7 +113,30 @@ if [ "${arch}" = "x86" ]; then
     exit 1
 fi
 
-mirror="${mirror_base}/${arch}/current-stage3/"
+if [ "${EUID}" != "0" ]; then
+    echo "This script must be run as 'root'"
+    exit 1
+fi
+
+if [ ! -d ${cache} ]; then
+    info "Creating cache dir '${cache}' ..."
+    mkdir -p ${cache}
+    if [ ${?} -ne 0 ]; then
+        echo "Error creating cache dir"
+        exit 1
+    fi
+fi
+
+if [ ! -d /var/lock/subsys && ${is_gentoo} ]; then
+    info "Creating control dir '/var/lock/subsys' ..."
+    mkdir -p /var/lock/subsys
+    if [ ${?} -ne 0 ]; then
+        echo "Error creating control dir"
+        exit 1
+    fi
+fi
+
+mirror="${mirror_base}/releases/${arch}/current-stage3/"
 info "Getting dir list of stage3 from '${mirror}'"
 
 stage3=$(curl -s -S -f "${mirror}" | sed -n "s/.*\(stage3-${arch}-[0-9]\{8\}\.tar\.bz2\)[^.].*/\1/p")
@@ -165,7 +167,7 @@ portage_path="${cache}/portage-latest.tar.bz2"
 
 if [ ! -e "${portage_path}" ]; then
 
-    portage_url="${mirror}../snapshots/portage-latest.tar.bz2"
+    portage_url="${mirror_base}/snapshots/portage-latest.tar.bz2"
     info "Downloading '${portage_url}' ..."
 
     tmpportage=$(mktemp --tmpdir "${portage}.XXXXXXXXXX")
@@ -220,17 +222,29 @@ trap revert SIGHUP SIGINT SIGTERM
 
     echo "hostname=\"${name}\"" > ${rootfs_path}/etc/conf.d/hostname
 
-    echo "root:root" | chroot ${rootfs_path} chpasswd
+    if [ ${password} ]; then
+        echo "root:${password}" | chroot ${rootfs_path} chpasswd
+    fi
 
     sed 's/^#rc_sys=""/rc_sys="lxc"/' -i ${rootfs_path}/etc/rc.conf
-    mkdir -m 755 "${rootfs_path}/dev/pts"
+
     sed -i 's/^c[1-9]/#&/' ${rootfs_path}/etc/inittab
     echo "1:12345:respawn:/sbin/agetty --noclear -a root 38400 console linux" >> ${rootfs_path}/etc/inittab
-    echo "This is \n (\s \m \r) LXC" > ${rootfs_path}/etc/issue
-#    sed -i 's/^\(\s*keyword .*\)$/\1 -lxc/' ${rootfs_path}/etc/init.d/termencoding
+    echo "pf:12345:powerwait:/sbin/halt" >> ${rootfs_path}/etc/inittab # support SIGPWR to shutdown
 
-    # Trim down /dev by creating only required devices
+    echo "This is \n (\s \m \r) LXC" > ${rootfs_path}/etc/issue
+
+    # Trim down /dev, create only required devices
     find ${rootfs_path}/dev -mindepth 1 -delete
+    
+    # these are mount points, no need to give permission underneath them
+    mkdir -m 000 "${rootfs_path}/dev/shm"
+    mkdir -m 000 "${rootfs_path}/dev/pts"
+
+    ln -s /proc/self/fd   "${rootfs_path}/dev/fd"
+    ln -s /proc/self/fd/0 "${rootfs_path}/dev/stdin"
+    ln -s /proc/self/fd/1 "${rootfs_path}/dev/stdout"
+    ln -s /proc/self/fd/2 "${rootfs_path}/dev/stderr"
 
 #    mknod -m 600 "${rootfs_path}/dev/mem"       c 1 1
 #    mknod -m 600 "${rootfs_path}/dev/kmem"      c 1 2
@@ -255,17 +269,6 @@ trap revert SIGHUP SIGINT SIGTERM
 
     mknod -m 600 "${rootfs_path}/dev/initctl"   p
 
-    # these are mount points, no need to give permission underneath them
-    mkdir -m 000 "${rootfs_path}/dev/shm"
-    mkdir -m 000 "${rootfs_path}/dev/pts"
-    #mkdir -m 755 "${rootfs_path}/dev/pts"
-    #mkdir -m 1777 "${rootfs_path}/dev/shm"
-
-    ln -s /proc/self/fd   "${rootfs_path}/dev/fd"
-    ln -s /proc/self/fd/0 "${rootfs_path}/dev/stdin"
-    ln -s /proc/self/fd/1 "${rootfs_path}/dev/stdout"
-    ln -s /proc/self/fd/2 "${rootfs_path}/dev/stderr"
-
     cat <<EOF > "${config_path}"
 # Container hostname
 lxc.utsname = ${name}
@@ -283,7 +286,7 @@ lxc.rootfs = ${rootfs_path}
 lxc.network.type = veth
 lxc.network.flags = up
 lxc.network.link = br0
-lxc.network.mtu = 1500
+#lxc.network.mtu = 1500
 #lxc.network.hwaddr = C0:FF:EE:C0:FF:EE
 
 # console access
@@ -355,9 +358,8 @@ EOF
 
 ) 200>/var/lock/subsys/lxc
 
-cat <<DONE
-Container ${name} sucessfully created.  Default login/password is root/root
-The password should immediately be changed to something secure!
-
-DONE
+echo "Container ${name} sucessfully created."
+if [ ! ${password} ]; then
+    echo "Remote login will be unavailable until you set a root password."
+fi
 

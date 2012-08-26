@@ -34,6 +34,7 @@ templates/lxc-altlinux
 templates/lxc-sshd
 templates/lxc-busybox
 templates/lxc-archlinux
+templates/lxc-gentoo
 
 src/lxc/lxc-attach
 src/lxc/lxc-cgroup
