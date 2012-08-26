@@ -1,0 +1,363 @@
+#!/bin/bash
+
+#
+# template script for generating Gentoo linux container for LXC
+#
+
+#
+# lxc: linux Container library
+
+# Authors:
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+# defaults
+cache=/var/cache/lxc/gentoo
+default_path=/var/lib/lxc
+mirror_base="http://distfiles.gentoo.org/releases"
+
+if [ "${EUID}" != "0" ]; then
+    echo "This script must be run as 'root'"
+    exit 1
+fi
+
+if [ ! -d ${cache} ]; then
+    info "Creating cache dir '${cache}' ..."
+    mkdir -p ${cache}
+    if [ ${?} -ne 0 ]; then
+        echo "Error creating cache dir"
+        exit 1
+    fi
+fi
+
+if [ ! -d /var/lock/subsys ]; then
+    info "Creating control dir '/var/lock/subsys' ..."
+    mkdir -p /var/lock/subsys
+    if [ ${?} -ne 0 ]; then
+        echo "Error creating control dir"
+        exit 1
+    fi
+fi
+
+[ -f /etc/gentoo-release ] && is_gentoo=true
+
+info()
+{
+    ((verbose)) && command echo "$@" || return 0;
+}
+
+usage()
+{
+    cat <<EOF
+Usage: ${1} [OPTION]...
+Mandatory args:
+  -n,--name=NAME    container name
+Optional args:
+  -p,--path=PATH    directory for the container rootfs and config, defaults
+                    to '${default_path}/<name>'
+  -a,--arch         architecture (x86 or amd64), defaults to current architecture
+  -v,--verbose      verbose mode
+  -d,--debug        debug mode
+  -h,--help         print this help
+EOF
+    return 0
+}
+
+options=$(getopt -o vdhp:n:a: -l verbose,debug,help,path:,name:arch -- "${@}")
+if [ ${?} -ne 0 ]; then
+    usage $(basename ${0})
+    exit 1
+fi
+eval set -- "${options}"
+
+while true
+do
+    case "${1}" in
+    -h|--help)      usage ${0} && exit 0;;
+    -v|--verbose)   verbose=1;    shift 1;;
+    -d|--debug)     debug=1;      shift 1;;
+    -p|--path)      ct_path=${2}; shift 2;;
+    -n|--name)      name=${2};    shift 2;;
+    -a|--arch)      arch=${2};    shift 2;;
+    --)             shift 1;      break ;;
+    *)              break ;;
+    esac
+done
+
+if [ ${debug} ]; then
+    set -x
+fi
+
+if [ -z "${name}" ]; then
+    echo "Error: --name arg required"
+    exit 1
+fi
+
+if [ -z "${ct_path}" ]; then
+    ct_path="${default_path}/${name}"
+fi
+
+if [ -e "$ct_path" ]; then
+    echo "Error: dir '${ct_path}' already exists (check for existing CT with same name)"
+    exit 1
+fi
+
+if [ -e "/etc/lxc/${name}" ]; then
+    echo "Error: dir '/etc/lxc/${name}' already exists (check for existing CT with same name)"
+    exit 1
+fi
+
+if [ -z "${arch}" ]; then
+    echo "Defaulting arch to amd64"
+    arch="amd64"
+fi
+
+if [[ "${arch}" != "amd64" && "${arch}" != "x86" ]]; then
+    echo "Architecture '${arch}' not supported, only x86 or amd64"
+    exit 1
+fi
+
+if [ "${arch}" = "x86" ]; then
+    echo "x86 arch support broken"
+    exit 1
+fi
+
+mirror="${mirror_base}/${arch}/current-stage3/"
+info "Getting dir list of stage3 from '${mirror}'"
+
+stage3=$(curl -s -S -f "${mirror}" | sed -n "s/.*\(stage3-${arch}-[0-9]\{8\}\.tar\.bz2\)[^.].*/\1/p")
+
+stage3_path="${cache}/${stage3}"
+
+if [ ! -e "${stage3_path}" ]; then
+
+    stage3_url="${mirror}${stage3}"
+    info "Downloading '${stage3_url}' ..."
+
+    tmps3=$(mktemp --tmpdir "${stage3}.XXXXXXXXXX")
+    curl -s -S -f "${stage3_url}" > "${tmps3}"
+    (
+        flock -n -x 200
+        if [ $? -ne 0 ]; then
+            echo "Cache repository is busy."
+            exit 1
+        fi
+
+        mv "${tmps3}" "${stage3_path}"
+    ) 200>/var/lock/subsys/lxc
+else
+    info "Found existing stage3 at '${stage3_path}'"
+fi
+
+portage_path="${cache}/portage-latest.tar.bz2"
+
+if [ ! -e "${portage_path}" ]; then
+
+    portage_url="${mirror}../snapshots/portage-latest.tar.bz2"
+    info "Downloading '${portage_url}' ..."
+
+    tmpportage=$(mktemp --tmpdir "${portage}.XXXXXXXXXX")
+    curl -s -S -f "${portage_url}" > "${tmpportage}"
+    (
+        flock -n -x 200
+        if [ $? -ne 0 ]; then
+            echo "Cache repository is busy."
+            exit 1
+        fi
+        mv "${tmpportage}" "${portage_path}"
+    ) 200>/var/lock/subsys/lxc
+else
+    info "Found existing portage-latest.tar.bz2 at '${portage_path}'"
+fi
+
+
+
+lxc_network_type="veth"
+lxc_network_link="br0"
+
+rootfs_path="${ct_path}/rootfs"
+config_path="${ct_path}/config"
+
+revert()
+{
+    # This isn't done automatically yet!  We need to verify that a user
+    # can specify a bogus path ie: --path=/ or similar and we accidentally rm -rf
+    # the entire system.
+
+    echo "Interrupted, these paths may need to be removed manually (verify first):"
+    echo ${ct_path}
+    echo "/etc/lxc/${name}"
+    exit 1
+}
+trap revert SIGHUP SIGINT SIGTERM
+
+(
+    flock -n -x 200
+    if [ $? -ne 0 ]; then
+        echo "Cache repository is busy."
+        exit 1
+    fi
+
+    info "Untaring stage3 to '${rootfs_path}'"
+
+    mkdir -p "${rootfs_path}"
+    tar xjpf "${stage3_path}" -C "${rootfs_path}"
+    tar xjpf "${portage_path}" -C "${rootfs_path}/usr"
+
+    info "Setting hostname, root password, boot time params ..."
+
+    echo "hostname=\"${name}\"" > ${rootfs_path}/etc/conf.d/hostname
+
+    echo "root:root" | chroot ${rootfs_path} chpasswd
+
+    sed 's/^#rc_sys=""/rc_sys="lxc"/' -i ${rootfs_path}/etc/rc.conf
+    mkdir -m 755 "${rootfs_path}/dev/pts"
+    sed -i 's/^c[1-9]/#&/' ${rootfs_path}/etc/inittab
+    echo "1:12345:respawn:/sbin/agetty --noclear -a root 38400 console linux" >> ${rootfs_path}/etc/inittab
+    echo "This is \n (\s \m \r) LXC" > ${rootfs_path}/etc/issue
+#    sed -i 's/^\(\s*keyword .*\)$/\1 -lxc/' ${rootfs_path}/etc/init.d/termencoding
+
+    # Trim down /dev by creating only required devices
+    find ${rootfs_path}/dev -mindepth 1 -delete
+
+#    mknod -m 600 "${rootfs_path}/dev/mem"       c 1 1
+#    mknod -m 600 "${rootfs_path}/dev/kmem"      c 1 2
+    mknod -m 666 "${rootfs_path}/dev/null"      c 1 3
+#    mknod -m 600 "${rootfs_path}/dev/port"      c 1 4
+    mknod -m 666 "${rootfs_path}/dev/zero"      c 1 5
+    mknod -m 666 "${rootfs_path}/dev/full"      c 1 7
+    mknod -m 644 "${rootfs_path}/dev/random"    c 1 8
+    mknod -m 644 "${rootfs_path}/dev/urandom"   c 1 9
+    mknod -m 666 "${rootfs_path}/dev/pytp0"     c 2 0
+    mknod -m 666 "${rootfs_path}/dev/tty0"      c 4 0
+    mknod -m 666 "${rootfs_path}/dev/tty"       c 5 0
+    # don't rely on host id and group vals, default Gentoo root=0:tty=5
+    chown 0:5 "${rootfs_path}/dev/tty"
+
+    mknod -m 600 "${rootfs_path}/dev/console"   c 5 1
+    mknod -m 666 "${rootfs_path}/dev/ptmx"      c 5 2
+#    ln -s pts/ptmx "${rootfs_path}/dev/ptmx"
+
+    mkdir -m 755 "${rootfs_path}/dev/net"
+    mknod -m 666 "${rootfs_path}/dev/net/tun"   c 10 200
+
+    mknod -m 600 "${rootfs_path}/dev/initctl"   p
+
+    # these are mount points, no need to give permission underneath them
+    mkdir -m 000 "${rootfs_path}/dev/shm"
+    mkdir -m 000 "${rootfs_path}/dev/pts"
+    #mkdir -m 755 "${rootfs_path}/dev/pts"
+    #mkdir -m 1777 "${rootfs_path}/dev/shm"
+
+    ln -s /proc/self/fd   "${rootfs_path}/dev/fd"
+    ln -s /proc/self/fd/0 "${rootfs_path}/dev/stdin"
+    ln -s /proc/self/fd/1 "${rootfs_path}/dev/stdout"
+    ln -s /proc/self/fd/2 "${rootfs_path}/dev/stderr"
+
+    cat <<EOF > "${config_path}"
+# Container hostname
+lxc.utsname = ${name}
+
+# Container arch (x86, amd64)
+lxc.arch = ${arch}
+
+# root filesystem location
+lxc.rootfs = ${rootfs_path}
+
+# Console log, disable when running container in foreground
+#lxc.console = /var/log/lxc/${name}.log
+
+# NIC settings
+lxc.network.type = veth
+lxc.network.flags = up
+lxc.network.link = br0
+lxc.network.mtu = 1500
+#lxc.network.hwaddr = C0:FF:EE:C0:FF:EE
+
+# console access
+lxc.tty = 1
+lxc.pts = 128
+
+
+## Capabilities
+
+# Docs: man 7 capabilities
+lxc.cap.drop = mac_admin
+lxc.cap.drop = mac_override
+lxc.cap.drop = sys_boot
+lxc.cap.drop = sys_module
+lxc.cap.drop = sys_time
+
+# Format is: [c|b] [major|*]:[minor|*] [r][w][m]
+#             ^     ^                   ^
+# char/block -'     \`- device numbers   \`-- read, write, mknod
+#
+# Deny all devices except those explicitly defined below
+lxc.cgroup.devices.deny = a
+
+# Allow all devices (dangerous)
+#lxc.cgroup.devices.allow = a
+
+# Explicitly allow to mknod all devices (but not use them)
+lxc.cgroup.devices.allow = c *:* m
+lxc.cgroup.devices.allow = b *:* m
+
+# Explicitly allow these devices
+lxc.cgroup.devices.allow = c 1:3 rwm    # /dev/null
+lxc.cgroup.devices.allow = c 1:5 rwm    # /dev/zero
+lxc.cgroup.devices.allow = c 1:7 rwm    # /dev/full
+lxc.cgroup.devices.allow = c 1:8 rwm    # /dev/random
+lxc.cgroup.devices.allow = c 1:9 rwm    # /dev/urandom
+lxc.cgroup.devices.allow = c 4:0 rwm    # /dev/tty0, see console setting lxc.tty = X
+lxc.cgroup.devices.allow = c 4:1 rwm    # /dev/tty1, see console setting lxc.tty = X
+lxc.cgroup.devices.allow = c 5:0 rwm    # /dev/tty - allows ssh-add/password input
+lxc.cgroup.devices.allow = c 5:1 rwm    # /dev/console - allows lxc-start output
+lxc.cgroup.devices.allow = c 5:2 rwm    # /dev/pts/ptmx
+lxc.cgroup.devices.allow = c 10:200 rwm # /dev/net/tun
+lxc.cgroup.devices.allow = c 10:229 rwm # /dev/fuse
+lxc.cgroup.devices.allow = c 136:* rwm  # /dev/pts/*
+lxc.cgroup.devices.allow = c 254:0 rwm  # /dev/rtc
+
+
+## Container Limits
+
+# Docs: /usr/src/<kernel>/Documentation/cgroups/cpusets.txt
+#lxc.cgroup.cpuset.cpus = 0,1
+#lxc.cgroup.cpu.shares = 1024
+
+# Docs: /usr/src/<kernel>/Documentation/cgroups/memory.txt
+#lxc.cgroup.memory.limit_in_bytes = 1024M
+#lxc.cgroup.memory.memsw.limit_in_bytes = 2048M
+EOF
+
+    cp /etc/resolv.conf "${rootfs_path}/etc"
+
+    # Set the virtual NIC to start at boot (see Gentoo handbook for details)
+    ln -s net.lo "${rootfs_path}/etc/init.d/net.eth0"
+    chroot ${rootfs_path} rc-update add net.eth0 default
+    chroot ${rootfs_path} rc-update add sshd default
+
+    # symlink config to /etc so lxc-* scripts work without -f switch
+    mkdir "/etc/lxc/${name}"
+    ln -s "${config_path}" "/etc/lxc/${name}/config"
+
+) 200>/var/lock/subsys/lxc
+
+cat <<DONE
+Container ${name} sucessfully created.  Default login/password is root/root
+The password should immediately be changed to something secure!
+
+DONE
+
