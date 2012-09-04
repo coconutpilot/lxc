@@ -28,8 +28,6 @@ cache=/var/cache/lxc/gentoo
 default_path=/var/lib/lxc
 mirror_base="http://distfiles.gentoo.org"
 
-[ -f /etc/gentoo-release ] && is_gentoo=true
-
 info()
 {
     ((verbose)) && command echo "$@" || return 0;
@@ -46,6 +44,10 @@ Optional args:
                     to '${default_path}/<name>'
   -a,--arch         architecture (x86 or amd64), defaults to current architecture
      --password     password for root account
+  -4,--ipv4         specify the ipv4 address to assign to the virtualized interface, eg. 192.168.1.123/24
+  -6,--ipv6         specify the ipv6 address to assign to the virtualized interface, eg. 2003:db8:1:0:214:1234:fe0b:3596/64
+  -g,--gwv4         specify the default gw, eg. 192.168.1.1
+  -G,--gwv6         specify the default gw, eg. 2003:db8:1:0:214:1234:fe0b:3596
   -v,--verbose      verbose mode
   -d,--debug        debug mode
   -h,--help         print this help
@@ -53,7 +55,8 @@ EOF
     return 0
 }
 
-options=$(getopt -o vdhp:n:a: -l verbose,debug,help,path:,name:,arch:,password: -- "${@}")
+options=$(getopt -o vdhp:n:a:4:6:g:G: -l verbose,debug,help,path:,name:,arch:,password::ipv4:ipv6:gwv4:gwv6: -- "${@}")
+
 if [ ${?} -ne 0 ]; then
     usage $(basename ${0})
     exit 1
@@ -70,6 +73,10 @@ do
     -n|--name)      name=${2};    shift 2;;
     -a|--arch)      arch=${2};    shift 2;;
        --password)  password=${2} shift 2;;
+    -4|--ipv4)      ipv4=$2;      shift 2;;
+    -6|--ipv6)      ipv6=$2;      shift 2;;
+    -g|--gwv4)      gwv4=$2;      shift 2;;
+    -G|--gwv6)      gwv6=$2;      shift 2;;
     --)             shift 1;      break ;;
     *)              break ;;
     esac
@@ -88,28 +95,13 @@ if [ -z "${ct_path}" ]; then
     ct_path="${default_path}/${name}"
 fi
 
-if [ -e "$ct_path" ]; then
-    echo "Error: dir '${ct_path}' already exists (check for existing CT with same name)"
-#    exit 1
-fi
-
-if [ -e "/etc/lxc/${name}" ]; then
-    echo "Error: dir '/etc/lxc/${name}' already exists (check for existing CT with same name)"
-#    exit 1
-fi
-
 if [ -z "${arch}" ]; then
     echo "Defaulting arch to amd64"
     arch="amd64"
 fi
 
-if [[ "${arch}" != "amd64" && "${arch}" != "x86" ]]; then
+if [ "${arch}" != "amd64" -a "${arch}" != "x86" ]; then
     echo "Architecture '${arch}' not supported, only x86 or amd64"
-    exit 1
-fi
-
-if [ "${arch}" = "x86" ]; then
-    echo "x86 arch support broken"
     exit 1
 fi
 
@@ -127,7 +119,7 @@ if [ ! -d ${cache} ]; then
     fi
 fi
 
-if [ ! -d /var/lock/subsys && ${is_gentoo} ]; then
+if [ ! -d /var/lock/subsys ]; then
     info "Creating control dir '/var/lock/subsys' ..."
     mkdir -p /var/lock/subsys
     if [ ${?} -ne 0 ]; then
@@ -139,7 +131,12 @@ fi
 mirror="${mirror_base}/releases/${arch}/current-stage3/"
 info "Getting dir list of stage3 from '${mirror}'"
 
-stage3=$(curl -s -S -f "${mirror}" | sed -n "s/.*\(stage3-${arch}-[0-9]\{8\}\.tar\.bz2\)[^.].*/\1/p")
+stage3=$(curl -s -S -f "${mirror}" | sed -n "s/.*\(stage3-\(i686\|amd64\)-[0-9]\{8\}\.tar\.bz2\)[^.].*/\1/p")
+
+if [ -z "$stage3" ]; then
+    echo "Error: unable to locate stage3 from '${mirror}'"
+    exit 1
+fi
 
 stage3_path="${cache}/${stage3}"
 
@@ -149,7 +146,7 @@ if [ ! -e "${stage3_path}" ]; then
     info "Downloading '${stage3_url}' ..."
 
     tmps3=$(mktemp --tmpdir "${stage3}.XXXXXXXXXX")
-    curl -s -S -f "${stage3_url}" > "${tmps3}"
+    curl -f "${stage3_url}" > "${tmps3}"
     (
         flock -n -x 200
         if [ $? -ne 0 ]; then
@@ -345,6 +342,24 @@ lxc.cgroup.devices.allow = c 254:0 rwm  # /dev/rtc
 #lxc.cgroup.memory.memsw.limit_in_bytes = 2048M
 EOF
 
+    if [ ${ipv4} ]; then
+        ips="${ipv4}\n"
+    fi
+    if [ ${ipv6} ]; then
+        ips+="${ipv6}\n"
+    fi
+    echo -e "config_eth0=\"\n${ips}\"" >> "${rootfs_path}/etc/conf.d/net"
+
+
+    if [ ${gwv4} ]; then
+        gws="default via ${gwv4}\n"
+    fi
+    if [ ${gwv6} ]; then
+        gws+="default via ${gwv6}\n"
+    fi
+    echo -e "routes_eth0=\"\n${gws}\"" >> "${rootfs_path}/etc/conf.d/net"
+
+    # XXX: consider making this an option ...
     cp /etc/resolv.conf "${rootfs_path}/etc"
 
     # Set the virtual NIC to start at boot (see Gentoo handbook for details)
@@ -360,6 +375,6 @@ EOF
 
 echo "Container ${name} sucessfully created."
 if [ ! ${password} ]; then
-    echo "Remote login will be unavailable until you set a root password."
+    echo "root account has no password.  Remote login unavailable."
 fi
 
